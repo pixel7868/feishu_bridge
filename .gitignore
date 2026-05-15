@@ -1,0 +1,26 @@
+# Local secrets and runtime config
+feishu_bridge/local_settings.json
+feishu_bridge/local_secrets.json
+feishu_bridge/local_settings.private.json
+.env
+
+# Runtime state, logs, sockets, screenshots, and caches
+feishu_bridge/runtime/
+runtime/
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*.log
+*.pid
+*.sock
+*.png
+
+# Tooling output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.venv/
+

@@ -1,0 +1,23 @@
+{
+  "command_prefix": "/",
+  "receive_mode": "long_connection",
+  "host": "127.0.0.1",
+  "port": 9000,
+  "poll_interval_seconds": 1.0,
+  "forward_desktop_user_messages": true,
+  "feishu_streaming": true,
+  "message_mode": "appserver",
+  "direct_sandbox": "danger-full-access",
+  "direct_approval_policy": "never",
+  "direct_turn_timeout_seconds": 600,
+  "appserver_sandbox": "",
+  "appserver_approval_policy": "",
+  "appserver_model": "",
+  "appserver_turn_timeout_seconds": 0,
+  "appserver_use_running_server": false,
+  "appserver_websocket_url": "",
+  "appserver_auto_recovery_rounds": 3,
+  "haindy_command": "python",
+  "haindy_command_args": ["-m", "haindy.main"],
+  "haindy_timeout_seconds": 180
+}
