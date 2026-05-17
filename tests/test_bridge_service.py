@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import feishu_bridge.bridge_service as bridge_service
 from feishu_bridge.bridge_service import CodexFeishuBridgeService
 from feishu_bridge.codex_thread_bridge import CodexBridgeError, CodexThreadBridgeService
 from feishu_bridge.settings import BridgeSettings
@@ -44,6 +45,36 @@ def write_event(handle, event_type: str, message: str, *, phase: str | None = No
 
 
 class BridgeServiceWatcherTests(unittest.TestCase):
+    def test_direct_message_uses_existing_binding_instead_of_new_thread(self) -> None:
+        new_thread_messages: list[str] = []
+        existing_thread_messages: list[tuple[str, str]] = []
+
+        class FakeRunner:
+            def __init__(self, options) -> None:
+                self.options = options
+
+            def submit_new_thread_message(self, text: str) -> str:
+                new_thread_messages.append(text)
+                return "new-thread"
+
+            def submit_existing_thread_message(self, thread_id: str, text: str) -> None:
+                existing_thread_messages.append((thread_id, text))
+
+        original_runner = bridge_service.AppServerTurnRunner
+        bridge_service.AppServerTurnRunner = FakeRunner
+        try:
+            service = CodexFeishuBridgeService(BridgeSettings(message_mode="direct"))
+            service._log = lambda message: None
+            service._start_watcher = lambda chat_id, thread_id: None
+            service._bindings["chat-1"] = ChatBinding("chat-1", "existing-thread", 100)
+
+            service._handle_direct_chat_message("chat-1", "second message")
+        finally:
+            bridge_service.AppServerTurnRunner = original_runner
+
+        self.assertEqual(new_thread_messages, [])
+        self.assertEqual(existing_thread_messages, [("existing-thread", "second message")])
+
     def test_watcher_reads_rollout_when_session_index_is_missing(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)

@@ -427,11 +427,26 @@ class CodexFeishuBridgeService:
     def _handle_direct_chat_message(self, chat_id: str, text: str) -> None:
         self._remember_suppressed_text(chat_id, text)
         options = self._direct_turn_options()
+        with self._lock:
+            binding = self._bindings.get(chat_id)
+        runner = AppServerTurnRunner(options)
+        if binding is not None:
+            self._log(
+                "direct mode submitting to bound Codex thread "
+                f"chat_id={chat_id} thread_id={binding.thread_id} "
+                f"cwd={options.cwd} sandbox={options.sandbox}"
+            )
+            runner.submit_existing_thread_message(binding.thread_id, text)
+            self._log(
+                "direct mode submitted message "
+                f"chat_id={chat_id} thread_id={binding.thread_id}"
+            )
+            return
+
         self._log(
             "direct mode starting isolated Codex thread "
             f"chat_id={chat_id} cwd={options.cwd} sandbox={options.sandbox}"
         )
-        runner = AppServerTurnRunner(options)
         thread_id = runner.submit_new_thread_message(text)
         self._bind_chat_to_thread(chat_id, thread_id, offset=0)
         self._log(f"direct mode submitted message chat_id={chat_id} thread_id={thread_id}")
