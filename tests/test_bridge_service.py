@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 
 import feishu_bridge.bridge_service as bridge_service
 from feishu_bridge.bridge_service import CodexFeishuBridgeService
-from feishu_bridge.codex_thread_bridge import CodexBridgeError, CodexThreadBridgeService
+from feishu_bridge.codex_thread_bridge import CodexBridgeError, CodexThreadBridgeService, CodexThreadInfo
 from feishu_bridge.settings import BridgeSettings
 from feishu_bridge.state import ChatBinding
 
@@ -35,6 +35,24 @@ class RolloutOnlyBridge:
 
     def read_messages_since(self, rollout_path, thread, offset):
         return self.parser.read_messages_since(rollout_path, thread, offset)
+
+
+class StaticThreadBridge:
+    def __init__(self, threads: list[CodexThreadInfo], rollout_path: Path) -> None:
+        self.threads = threads
+        self.rollout_path = rollout_path
+
+    def list_threads(self) -> list[CodexThreadInfo]:
+        return list(self.threads)
+
+    def get_thread(self, thread_id: str):
+        for thread in self.threads:
+            if thread.thread_id == thread_id:
+                return thread
+        raise CodexBridgeError(f"Thread not found in session index: {thread_id}")
+
+    def resolve_rollout_path(self, thread_id: str) -> Path:
+        return self.rollout_path
 
 
 def write_event(handle, event_type: str, message: str, *, phase: str | None = None) -> None:
@@ -74,6 +92,69 @@ class BridgeServiceWatcherTests(unittest.TestCase):
 
         self.assertEqual(new_thread_messages, [])
         self.assertEqual(existing_thread_messages, [("existing-thread", "second message")])
+
+    def test_mode_direct_auto_binds_latest_thread(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout_path = root / "rollout-2026-05-17T16-12-49-latest-thread.jsonl"
+            rollout_path.write_text("", encoding="utf-8")
+            service = CodexFeishuBridgeService(
+                BridgeSettings(command_prefix="$", message_mode="simulate", runtime_dir=root)
+            )
+            service._log = lambda message: None
+            service._start_watcher = lambda chat_id, thread_id: None
+            service._persist_message_mode = lambda mode: None
+            service.bridge = StaticThreadBridge(
+                [CodexThreadInfo("latest-thread", "Latest Thread", "2026-05-17T12:00:00Z")],
+                rollout_path,
+            )
+
+            response = service._handle_mode_command("chat-1", "d")
+
+            self.assertEqual(service.settings.message_mode, "direct")
+            self.assertEqual(service._bindings["chat-1"].thread_id, "latest-thread")
+            self.assertIn("已自动绑定当前最近 Codex 线程", response)
+            self.assertIn("latest-thread", response)
+
+    def test_direct_message_without_binding_uses_latest_thread(self) -> None:
+        new_thread_messages: list[str] = []
+        existing_thread_messages: list[tuple[str, str]] = []
+
+        class FakeRunner:
+            def __init__(self, options) -> None:
+                self.options = options
+
+            def submit_new_thread_message(self, text: str) -> str:
+                new_thread_messages.append(text)
+                return "new-thread"
+
+            def submit_existing_thread_message(self, thread_id: str, text: str) -> None:
+                existing_thread_messages.append((thread_id, text))
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            rollout_path = root / "rollout-2026-05-17T16-12-49-latest-thread.jsonl"
+            rollout_path.write_text("", encoding="utf-8")
+            original_runner = bridge_service.AppServerTurnRunner
+            bridge_service.AppServerTurnRunner = FakeRunner
+            try:
+                service = CodexFeishuBridgeService(BridgeSettings(message_mode="direct", runtime_dir=root))
+                service._log = lambda message: None
+                service._start_watcher = lambda chat_id, thread_id: None
+                service.bridge = StaticThreadBridge(
+                    [CodexThreadInfo("latest-thread", "Latest Thread", "2026-05-17T12:00:00Z")],
+                    rollout_path,
+                )
+                service.feishu = RecordingFeishuClient()
+
+                service._handle_direct_chat_message("chat-1", "hello")
+            finally:
+                bridge_service.AppServerTurnRunner = original_runner
+
+        self.assertEqual(new_thread_messages, [])
+        self.assertEqual(existing_thread_messages, [("latest-thread", "hello")])
+        self.assertEqual(service._bindings["chat-1"].thread_id, "latest-thread")
+        self.assertIn("已自动绑定最近 Codex 线程", service.feishu.messages[0][1])
 
     def test_dollar_prefix_is_recognized_as_command_prefix(self) -> None:
         service = CodexFeishuBridgeService(BridgeSettings(command_prefix="$"))

@@ -8,9 +8,9 @@
 | 能力 | 说明 |
 |---|---|
 | `appserver` 模式 | 绑定已有 Codex thread，通过 `thread/resume + turn/start` 继续对话。 |
-| `direct` 模式 | 新建独立 Codex thread 并发送飞书消息。 |
+| `direct` 模式 | 绑定已有 Codex thread，并通过 Codex app-server 发送飞书消息。 |
 | `simulate` 模式 | 通过 HAINDY 操作 Codex Desktop UI，适合必须操作当前可见窗口的场景。 |
-| 飞书命令 | 支持 `/sessions`、`/attach`、`/mode`、`/status`、`/detach`。 |
+| 飞书命令 | 默认前缀为 `$`，支持 `$sessions`、`$attach`、`$mode`、`$status`、`$detach`。 |
 | 配置隔离 | 公开配置和私密 key 分开，避免误提交飞书凭据、chat id 和本机路径。 |
 
 ## 安装
@@ -88,14 +88,14 @@ http://127.0.0.1:9000/webhook/feishu
 
 | 命令 | 说明 |
 |---|---|
-| `/sessions` | 列出最近 Codex threads，并保存编号快照。 |
-| `/attach <编号或线程ID>` | 绑定当前飞书 chat 到 Codex thread。 |
-| `/mode` | 查看当前发送模式。 |
-| `/mode appserver` | 切到 appserver 模式。 |
-| `/mode direct` | 切到 direct 模式。 |
-| `/mode simulate` | 切到 simulate 模式。 |
-| `/status` | 查看当前绑定。 |
-| `/detach` | 解除绑定。 |
+| `$sessions` | 列出最近 Codex threads，并保存编号快照。 |
+| `$attach <编号或线程ID>` | 绑定当前飞书 chat 到 Codex thread。 |
+| `$mode` | 查看当前发送模式。 |
+| `$mode appserver` | 切到 appserver 模式，并自动绑定最近 Codex thread。 |
+| `$mode direct` | 切到 direct 模式，并自动绑定最近 Codex thread。 |
+| `$mode simulate` | 切到 simulate 模式。 |
+| `$status` | 查看当前绑定。 |
+| `$detach` | 解除绑定。 |
 
 ## Codex 同步机制
 

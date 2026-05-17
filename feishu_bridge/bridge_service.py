@@ -35,7 +35,6 @@ MESSAGE_MODE_ALIASES = {
 }
 APP_SERVER_NO_ROLLOUT_MARKER = "no rollout found for thread id"
 DEFAULT_APP_SERVER_AUTO_RECOVERY_ROUNDS = 3
-UNBOUND_THREAD_HINT = "当前会话还没有绑定 Codex 线程。\n先发 `/sessions` 查看，再用 `/attach <编号或线程ID>` 绑定。"
 
 
 @dataclass(slots=True)
@@ -60,6 +59,7 @@ class CodexFeishuBridgeService:
         self._suppressions: dict[str, list[tuple[float, str]]] = {}
         self._pending_ui_new_chats: set[str] = set()
         self._streaming_replies: dict[tuple[str, str], StreamingReplyState] = {}
+        self._chat_turn_locks: dict[str, threading.Lock] = {}
         self._streaming_disabled_until = 0.0
         self._lock = threading.Lock()
 
@@ -396,7 +396,7 @@ class CodexFeishuBridgeService:
             self.feishu.send_text_message(chat_id, self._build_status_text(chat_id))
             return
         if command == "mode":
-            self.feishu.send_text_message(chat_id, self._handle_mode_command(arg_text))
+            self.feishu.send_text_message(chat_id, self._handle_mode_command(chat_id, arg_text))
             return
         if command in {"recover", "recovery"}:
             self.feishu.send_text_message(chat_id, self._handle_recover_command(chat_id))
@@ -425,12 +425,24 @@ class CodexFeishuBridgeService:
         raise RuntimeError(f"Unsupported message_mode: {self.settings.message_mode!r}")
 
     def _handle_direct_chat_message(self, chat_id: str, text: str) -> None:
-        self._remember_suppressed_text(chat_id, text)
-        options = self._direct_turn_options()
-        with self._lock:
-            binding = self._bindings.get(chat_id)
-        runner = AppServerTurnRunner(options)
-        if binding is not None:
+        with self._chat_turn_lock(chat_id):
+            self._remember_suppressed_text(chat_id, text)
+            options = self._direct_turn_options()
+            with self._lock:
+                binding = self._bindings.get(chat_id)
+            if binding is None:
+                latest = self._bind_chat_to_latest_thread(chat_id)
+                if latest is None:
+                    self._safe_send_text_message(chat_id, self._unbound_thread_hint())
+                    return
+                binding = ChatBinding(chat_id=chat_id, thread_id=latest.thread_id, offset=0)
+                self._safe_send_text_message(
+                    chat_id,
+                    "当前会话未绑定，已自动绑定最近 Codex 线程后发送本条消息。\n"
+                    f"线程: {latest.thread_name}\n"
+                    f"线程ID: {latest.thread_id}",
+                )
+            runner = AppServerTurnRunner(options)
             self._log(
                 "direct mode submitting to bound Codex thread "
                 f"chat_id={chat_id} thread_id={binding.thread_id} "
@@ -441,97 +453,89 @@ class CodexFeishuBridgeService:
                 "direct mode submitted message "
                 f"chat_id={chat_id} thread_id={binding.thread_id}"
             )
-            return
-
-        self._log(
-            "direct mode starting isolated Codex thread "
-            f"chat_id={chat_id} cwd={options.cwd} sandbox={options.sandbox}"
-        )
-        thread_id = runner.submit_new_thread_message(text)
-        self._bind_chat_to_thread(chat_id, thread_id, offset=0)
-        self._log(f"direct mode submitted message chat_id={chat_id} thread_id={thread_id}")
 
     def _handle_appserver_chat_message(self, chat_id: str, text: str) -> None:
-        binding = self._require_binding(chat_id)
-        if binding is None:
-            return
-
-        self._remember_suppressed_text(chat_id, text)
-        options = self._appserver_turn_options()
-        original_thread_id = binding.thread_id
-        current_thread_id = binding.thread_id
-        attempted_thread_ids: set[str] = set()
-        max_rounds = self._appserver_auto_recovery_rounds()
-        last_no_rollout_error: CodexBridgeError | None = None
-        rebound_attempted = False
-        self._log(
-            "appserver mode submitting to bound Codex thread "
-            f"chat_id={chat_id} thread_id={binding.thread_id} "
-            f"cwd={options.cwd} sandbox={options.sandbox} "
-            f"use_running_server={options.use_running_server} "
-            f"websocket_url={options.websocket_url or ''}"
-        )
-        for round_number in range(1, max_rounds + 1):
-            attempted_thread_ids.add(current_thread_id)
-            try:
-                AppServerTurnRunner(options).submit_existing_thread_message(current_thread_id, text)
-                self._log(
-                    "appserver mode submitted message "
-                    f"chat_id={chat_id} thread_id={current_thread_id} round={round_number}"
-                )
-                if current_thread_id != original_thread_id:
-                    self._safe_send_text_message(
-                        chat_id,
-                        "已自动处理 app-server resume 失败："
-                        "原绑定线程不可恢复，已改绑最近线程并发送本条消息。\n"
-                        f"原线程ID: {original_thread_id}\n"
-                        f"当前线程ID: {current_thread_id}",
-                    )
+        with self._chat_turn_lock(chat_id):
+            binding = self._require_binding(chat_id)
+            if binding is None:
                 return
-            except CodexBridgeError as exc:
-                if not self._is_appserver_no_rollout_error(exc):
-                    raise
-                last_no_rollout_error = exc
-                self._log(
-                    "appserver no-rollout recovery needed "
-                    f"chat_id={chat_id} thread_id={current_thread_id} "
-                    f"round={round_number}/{max_rounds}: {exc}"
-                )
-                if round_number >= max_rounds:
-                    break
-                if not rebound_attempted:
-                    rebound_attempted = True
-                    candidate = self._select_appserver_recovery_thread(attempted_thread_ids)
-                    if candidate is not None:
-                        current_thread_id = candidate.thread_id
-                        self._bind_chat_to_thread(chat_id, current_thread_id)
-                        self._log(
-                            "appserver no-rollout recovery rebound to recent thread "
-                            f"chat_id={chat_id} thread_id={current_thread_id} "
-                            f"next_round={round_number + 1}/{max_rounds}"
+
+            self._remember_suppressed_text(chat_id, text)
+            options = self._appserver_turn_options()
+            original_thread_id = binding.thread_id
+            current_thread_id = binding.thread_id
+            attempted_thread_ids: set[str] = set()
+            max_rounds = self._appserver_auto_recovery_rounds()
+            last_no_rollout_error: CodexBridgeError | None = None
+            rebound_attempted = False
+            self._log(
+                "appserver mode submitting to bound Codex thread "
+                f"chat_id={chat_id} thread_id={binding.thread_id} "
+                f"cwd={options.cwd} sandbox={options.sandbox} "
+                f"use_running_server={options.use_running_server} "
+                f"websocket_url={options.websocket_url or ''}"
+            )
+            for round_number in range(1, max_rounds + 1):
+                attempted_thread_ids.add(current_thread_id)
+                try:
+                    AppServerTurnRunner(options).submit_existing_thread_message(current_thread_id, text)
+                    self._log(
+                        "appserver mode submitted message "
+                        f"chat_id={chat_id} thread_id={current_thread_id} round={round_number}"
+                    )
+                    if current_thread_id != original_thread_id:
+                        self._safe_send_text_message(
+                            chat_id,
+                            "已自动处理 app-server resume 失败："
+                            "原绑定线程不可恢复，已改绑最近线程并发送本条消息。\n"
+                            f"原线程ID: {original_thread_id}\n"
+                            f"当前线程ID: {current_thread_id}",
                         )
-                        continue
-                if round_number + 1 <= max_rounds:
-                    new_thread_id = self._submit_new_appserver_recovery_thread(
-                        chat_id,
-                        options,
-                        text,
-                        failed_thread_id=current_thread_id,
-                        round_number=round_number + 1,
-                        max_rounds=max_rounds,
-                    )
-                    self._safe_send_text_message(
-                        chat_id,
-                        "已自动处理 app-server resume 失败："
-                        "原绑定线程不可恢复，已新建线程并发送本条消息。\n"
-                        f"原线程ID: {original_thread_id}\n"
-                        f"当前线程ID: {new_thread_id}",
-                    )
                     return
-        raise CodexBridgeError(
-            f"App-server no-rollout 自动处理失败（最多 {max_rounds} 轮）: "
-            f"{last_no_rollout_error}"
-        ) from last_no_rollout_error
+                except CodexBridgeError as exc:
+                    if not self._is_appserver_no_rollout_error(exc):
+                        raise
+                    last_no_rollout_error = exc
+                    self._log(
+                        "appserver no-rollout recovery needed "
+                        f"chat_id={chat_id} thread_id={current_thread_id} "
+                        f"round={round_number}/{max_rounds}: {exc}"
+                    )
+                    if round_number >= max_rounds:
+                        break
+                    if not rebound_attempted:
+                        rebound_attempted = True
+                        candidate = self._select_appserver_recovery_thread(attempted_thread_ids)
+                        if candidate is not None:
+                            current_thread_id = candidate.thread_id
+                            self._bind_chat_to_thread(chat_id, current_thread_id)
+                            self._log(
+                                "appserver no-rollout recovery rebound to recent thread "
+                                f"chat_id={chat_id} thread_id={current_thread_id} "
+                                f"next_round={round_number + 1}/{max_rounds}"
+                            )
+                            continue
+                    if round_number + 1 <= max_rounds:
+                        new_thread_id = self._submit_new_appserver_recovery_thread(
+                            chat_id,
+                            options,
+                            text,
+                            failed_thread_id=current_thread_id,
+                            round_number=round_number + 1,
+                            max_rounds=max_rounds,
+                        )
+                        self._safe_send_text_message(
+                            chat_id,
+                            "已自动处理 app-server resume 失败："
+                            "原绑定线程不可恢复，已新建线程并发送本条消息。\n"
+                            f"原线程ID: {original_thread_id}\n"
+                            f"当前线程ID: {new_thread_id}",
+                        )
+                        return
+            raise CodexBridgeError(
+                f"App-server no-rollout 自动处理失败（最多 {max_rounds} 轮）: "
+                f"{last_no_rollout_error}"
+            ) from last_no_rollout_error
 
     def _appserver_auto_recovery_rounds(self) -> int:
         try:
@@ -625,8 +629,16 @@ class CodexFeishuBridgeService:
         with self._lock:
             binding = self._bindings.get(chat_id)
         if binding is None:
-            self.feishu.send_text_message(chat_id, UNBOUND_THREAD_HINT)
+            self.feishu.send_text_message(chat_id, self._unbound_thread_hint())
         return binding
+
+    def _chat_turn_lock(self, chat_id: str) -> threading.Lock:
+        with self._lock:
+            lock = self._chat_turn_locks.get(chat_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._chat_turn_locks[chat_id] = lock
+            return lock
 
     def _bind_chat_to_thread(self, chat_id: str, thread_id: str, *, offset: int | None = None) -> None:
         if offset is None:
@@ -640,6 +652,19 @@ class CodexFeishuBridgeService:
             self._bindings[chat_id] = ChatBinding(chat_id=chat_id, thread_id=thread_id, offset=offset)
             self._save_bindings()
         self._start_watcher(chat_id, thread_id)
+
+    def _bind_chat_to_latest_thread(self, chat_id: str) -> CodexThreadInfo | None:
+        threads = self.bridge.list_threads()
+        if not threads:
+            return None
+        latest = threads[0]
+        self._bind_chat_to_thread(chat_id, latest.thread_id)
+        with self._lock:
+            self._session_snapshots[chat_id] = threads[:10]
+            self._pending_ui_new_chats.discard(chat_id)
+            self._save_session_snapshots()
+            self._save_bindings()
+        return latest
 
     def _thread_name_for_binding(self, thread_id: str) -> str:
         try:
@@ -655,16 +680,27 @@ class CodexFeishuBridgeService:
             raise RuntimeError(f"message_mode must be one of {sorted(MESSAGE_MODES)}, got {mode!r}")
         return mode
 
-    def _handle_mode_command(self, arg_text: str) -> str:
+    def _handle_mode_command(self, chat_id: str, arg_text: str) -> str:
         target = arg_text.strip().lower()
         if not target:
             return f"当前消息模式: {self._message_mode()}\n可用: appserver, direct, simulate, a, d, s"
         target = MESSAGE_MODE_ALIASES.get(target, target)
         if target not in MESSAGE_MODES:
-            return "用法: /mode appserver、/mode direct、/mode simulate、/mode a、/mode d 或 /mode s"
+            prefix = self.settings.command_prefix
+            return f"用法: {prefix}mode appserver、{prefix}mode direct、{prefix}mode simulate、{prefix}mode a、{prefix}mode d 或 {prefix}mode s"
         self.settings.message_mode = target
         self._persist_message_mode(target)
-        return f"已切换消息模式: {target}"
+        if target not in {"appserver", "direct"}:
+            return f"已切换消息模式: {target}"
+        latest = self._bind_chat_to_latest_thread(chat_id)
+        if latest is None:
+            return f"已切换消息模式: {target}\n没有找到可自动绑定的 Codex 线程。"
+        return (
+            f"已切换消息模式: {target}\n"
+            "已自动绑定当前最近 Codex 线程。\n"
+            f"线程: {latest.thread_name}\n"
+            f"线程ID: {latest.thread_id}"
+        )
 
     def _persist_message_mode(self, mode: str) -> None:
         config_path = Path(__file__).resolve().parent / "local_settings.json"
@@ -715,7 +751,7 @@ class CodexFeishuBridgeService:
 
     def _handle_locate_input_command(self, chat_id: str) -> str:
         if self._message_mode() != "simulate":
-            return "手动定位输入框只在 simulate 模式可用。先用 `/mode s` 切换。"
+            return f"手动定位输入框只在 simulate 模式可用。先用 `{self.settings.command_prefix}mode s` 切换。"
         with self._lock:
             binding = self._bindings.get(chat_id)
         thread_name = self._thread_name_for_binding(binding.thread_id) if binding else ""
@@ -740,6 +776,7 @@ class CodexFeishuBridgeService:
             model=self.settings.direct_model,
             timeout_seconds=self.settings.direct_turn_timeout_seconds,
             use_running_server=False,
+            wait_for_completion=True,
         )
 
     def _appserver_turn_options(self) -> AppServerTurnOptions:
@@ -758,6 +795,7 @@ class CodexFeishuBridgeService:
             ),
             use_running_server=bool(self.settings.appserver_use_running_server),
             websocket_url=self.settings.appserver_websocket_url,
+            wait_for_completion=True,
         )
 
     @staticmethod
@@ -770,6 +808,7 @@ class CodexFeishuBridgeService:
         timeout_seconds: float,
         use_running_server: bool,
         websocket_url: str = "",
+        wait_for_completion: bool = False,
     ) -> AppServerTurnOptions:
         return AppServerTurnOptions(
             cwd=cwd.expanduser().resolve(),
@@ -779,6 +818,7 @@ class CodexFeishuBridgeService:
             timeout_seconds=max(float(timeout_seconds), 30.0),
             use_running_server=use_running_server,
             websocket_url=str(websocket_url or "").strip() or None,
+            wait_for_completion=wait_for_completion,
         )
 
     def _build_help_text(self) -> str:
@@ -795,7 +835,7 @@ class CodexFeishuBridgeService:
             f"{prefix}recover 清理 HAINDY 运行态但保留当前绑定\n"
             f"{prefix}detach 解除当前绑定\n"
             "appserver 会 resume 绑定线程并通过 Codex app-server 发 turn；"
-            "direct 会新开独立 Codex 线程；simulate 会通过 HAINDY 操作当前 Codex UI。"
+            "direct 会向绑定线程发 turn；simulate 会通过 HAINDY 操作当前 Codex UI。"
         )
 
     def _build_sessions_text(self, chat_id: str) -> str:
@@ -811,20 +851,21 @@ class CodexFeishuBridgeService:
             lines.append(f"{index}. {item.thread_name}")
             lines.append(f"ID: {item.thread_id}")
         lines.append(
-            "使用 `/attach 1` 或 `/attach <线程ID>` 绑定。数字编号固定为本次列表快照；"
+            f"使用 `{self.settings.command_prefix}attach 1` 或 `{self.settings.command_prefix}attach <线程ID>` 绑定。数字编号固定为本次列表快照；"
             "appserver 下后续消息会直接 resume 该线程；simulate 下 1-9 走 Codex Ctrl+数字快捷键。"
         )
         return "\n".join(lines)
 
     def _attach_chat(self, chat_id: str, arg_text: str) -> str:
         target = arg_text.strip()
+        prefix = self.settings.command_prefix
         if not target:
-            return "用法: /attach <编号或线程ID>，或 /attach n <编号>"
+            return f"用法: {prefix}attach <编号或线程ID>，或 {prefix}attach n <编号>"
         row_switch_number: int | None = None
         parts = target.split()
         if parts and parts[0].lower() == "n":
             if len(parts) != 2 or not parts[1].isdigit():
-                return "用法: /attach n <编号>，例如 /attach n 1"
+                return f"用法: {prefix}attach n <编号>，例如 {prefix}attach n 1"
             row_switch_number = int(parts[1])
             target = parts[1]
         live_threads = self.bridge.list_threads()
@@ -848,7 +889,7 @@ class CodexFeishuBridgeService:
                 with self._lock:
                     snapshot = list(self._session_snapshots.get(chat_id) or [])
                 if not snapshot:
-                    return "数字编号需要先发 `/sessions` 刷新列表快照；也可以直接用 `/attach <线程ID>`。"
+                    return f"数字编号需要先发 `{prefix}sessions` 刷新列表快照；也可以直接用 `{prefix}attach <线程ID>`。"
                 if 0 <= index < len(snapshot):
                     thread_id = snapshot[index].thread_id
                     thread_name = snapshot[index].thread_name
@@ -873,7 +914,7 @@ class CodexFeishuBridgeService:
             match = live_match[1] if live_match is not None else None
             thread_name = match.thread_name if match else thread_id
         if not thread_id:
-            return "没有找到目标线程，请先发 `/sessions` 查看。"
+            return f"没有找到目标线程，请先发 `{prefix}sessions` 查看。"
         mode = self._message_mode()
         if mode == "simulate":
             self._log(f"simulate mode switching Codex UI chat_id={chat_id} thread_id={thread_id}")
@@ -920,7 +961,7 @@ class CodexFeishuBridgeService:
                     f"目标线程: {thread_name or thread_id}\n"
                     f"线程ID: {thread_id}\n"
                     f"错误: {exc}\n"
-                    "可以先发 `/mode d` 切到 direct，或稍后再试 simulate 切换。"
+                    f"可以先发 `{prefix}mode d` 切到 direct，或稍后再试 simulate 切换。"
                 )
             self._bind_chat_to_thread(chat_id, thread_id)
             with self._lock:
@@ -974,7 +1015,11 @@ class CodexFeishuBridgeService:
             if time.time() >= deadline:
                 break
             time.sleep(0.5)
-        raise RuntimeError("已发送到 Codex UI，但无法从 rollout 反查新线程 ID。请用 `/sessions` 后 `/attach <编号>` 手动绑定。")
+        prefix = self.settings.command_prefix
+        raise RuntimeError(
+            "已发送到 Codex UI，但无法从 rollout 反查新线程 ID。"
+            f"请用 `{prefix}sessions` 后 `{prefix}attach <编号>` 手动绑定。"
+        )
 
     def _detach_chat(self, chat_id: str) -> str:
         with self._lock:
@@ -998,6 +1043,13 @@ class CodexFeishuBridgeService:
         except CodexBridgeError:
             thread_name = binding.thread_id
         return f"当前绑定线程: {thread_name}\n线程ID: {binding.thread_id}\n消息模式: {self._message_mode()}"
+
+    def _unbound_thread_hint(self) -> str:
+        prefix = self.settings.command_prefix
+        return (
+            "当前会话还没有绑定 Codex 线程。\n"
+            f"先发 `{prefix}sessions` 查看，再用 `{prefix}attach <编号或线程ID>` 绑定。"
+        )
 
     def _safe_send_text_message(self, chat_id: str, text: str) -> None:
         try:
