@@ -59,6 +59,7 @@ class BridgeServiceWatcherTests(unittest.TestCase):
                 feishu_streaming=False,
             )
             service = CodexFeishuBridgeService(settings)
+            service._log = lambda message: None
             service.bridge = RolloutOnlyBridge(rollout_path)
             service.feishu = RecordingFeishuClient()
             service._bindings["chat-1"] = ChatBinding("chat-1", "thread-1", 0)
