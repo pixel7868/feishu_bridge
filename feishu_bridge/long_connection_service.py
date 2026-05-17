@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import traceback
 import time
-from hashlib import sha256
 from typing import Any
 
 from feishu_bridge.bridge_service import CodexFeishuBridgeService
@@ -23,9 +22,7 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
         super().__init__(settings)
         self._ws_client: Any | None = None
         self._recent_event_keys: dict[str, float] = {}
-        self._recent_text_keys: dict[str, float] = {}
         self._dedupe_ttl_seconds = 120.0
-        self._text_dedupe_ttl_seconds = 7200.0
         self._started_at_epoch_ms = int(time.time() * 1000)
         self._stale_grace_ms = 10_000
 
@@ -88,12 +85,6 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
                 f"ignored duplicate long-connection message chat_id={chat_id} key={dedupe_key}"
             )
             return
-        text_key = self._message_text_dedupe_key(chat_id, text)
-        if text_key and self._is_duplicate_text_message(text_key):
-            self._log(
-                f"ignored duplicate long-connection text chat_id={chat_id} key={text_key}"
-            )
-            return
         try:
             self._log(f"received long-connection message chat_id={chat_id} text={text[:120]!r}")
             self.process_text_message(chat_id, text)
@@ -115,8 +106,7 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
             return ""
         return str(payload.get("text") or "").strip()
 
-    @staticmethod
-    def _message_dedupe_key(event: Any, message: Any, chat_id: str, text: str) -> str:
+    def _message_dedupe_key(self, event: Any, message: Any, chat_id: str, text: str) -> str:
         for owner, attr in (
             (message, "message_id"),
             (message, "message_id_v2"),
@@ -126,6 +116,9 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
             value = str(getattr(owner, attr, "") or "").strip()
             if value:
                 return f"id:{value}"
+        message_created_at = self._message_created_at_ms(message)
+        if message_created_at is not None:
+            return f"fallback:{chat_id}:{message_created_at}:{text}"
         return f"fallback:{chat_id}:{text}"
 
     @staticmethod
@@ -145,14 +138,6 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
             return value
         return None
 
-    def _message_text_dedupe_key(self, chat_id: str, text: str) -> str:
-        normalized = " ".join(str(text or "").split())
-        command_prefix = str(self.settings.command_prefix or "").strip()
-        if not normalized or (command_prefix and normalized.startswith(command_prefix)):
-            return ""
-        digest = sha256(normalized.encode("utf-8")).hexdigest()[:24]
-        return f"text:{chat_id}:{digest}"
-
     def _is_duplicate_message(self, key: str) -> bool:
         with self._lock:
             now = time.monotonic()
@@ -168,19 +153,3 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
             if seen_at is None:
                 return False
             return now - seen_at <= self._dedupe_ttl_seconds
-
-    def _is_duplicate_text_message(self, key: str) -> bool:
-        with self._lock:
-            now = time.monotonic()
-            expired = [
-                item_key
-                for item_key, seen_at in self._recent_text_keys.items()
-                if now - seen_at > self._text_dedupe_ttl_seconds
-            ]
-            for item_key in expired:
-                self._recent_text_keys.pop(item_key, None)
-            seen_at = self._recent_text_keys.get(key)
-            self._recent_text_keys[key] = now
-            if seen_at is None:
-                return False
-            return now - seen_at <= self._text_dedupe_ttl_seconds

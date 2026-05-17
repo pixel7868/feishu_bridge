@@ -49,6 +49,14 @@ class LongConnectionBridgeServiceTests(unittest.TestCase):
 
         self.assertEqual(service.received, [("chat-1", "$attach 1"), ("chat-1", "$attach 1")])
 
+    def test_repeated_normal_text_with_distinct_message_ids_is_processed(self) -> None:
+        service = RecordingLongConnectionBridgeService()
+
+        service._on_message_receive(make_message_event("message-1", "测试"))
+        service._on_message_receive(make_message_event("message-2", "测试"))
+
+        self.assertEqual(service.received, [("chat-1", "测试"), ("chat-1", "测试")])
+
     def test_same_message_id_is_still_deduped(self) -> None:
         service = RecordingLongConnectionBridgeService()
 
