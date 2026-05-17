@@ -234,7 +234,21 @@ class CodexFeishuBridgeService:
                 thread = self.bridge.get_thread(thread_id)
                 rollout_path = self.bridge.resolve_rollout_path(thread.thread_id)
                 break
-            except CodexBridgeError:
+            except CodexBridgeError as exc:
+                try:
+                    rollout_path = self.bridge.resolve_rollout_path(thread_id)
+                    thread = CodexThreadInfo(
+                        thread_id=thread_id,
+                        thread_name=thread_id,
+                        updated_at="",
+                    )
+                    self._log(
+                        "watcher using rollout without session index "
+                        f"chat_id={chat_id} thread_id={thread_id}: {exc}"
+                    )
+                    break
+                except CodexBridgeError:
+                    pass
                 time.sleep(max(self.settings.poll_interval_seconds, 0.2))
         if thread is None or rollout_path is None:
             return
@@ -251,7 +265,12 @@ class CodexFeishuBridgeService:
                         if not self._should_forward(chat_id, message):
                             continue
                         self._forward_message(chat_id, message)
-                except Exception:
+                except Exception as exc:
+                    self._log(
+                        "failed to forward Codex message "
+                        f"chat_id={chat_id} thread_id={thread_id}: {exc!r}\n"
+                        f"{traceback.format_exc()}"
+                    )
                     time.sleep(max(self.settings.poll_interval_seconds, 0.2))
                     continue
                 with self._lock:
@@ -414,7 +433,7 @@ class CodexFeishuBridgeService:
         )
         runner = AppServerTurnRunner(options)
         thread_id = runner.submit_new_thread_message(text)
-        self._bind_chat_to_thread(chat_id, thread_id)
+        self._bind_chat_to_thread(chat_id, thread_id, offset=0)
         self._log(f"direct mode submitted message chat_id={chat_id} thread_id={thread_id}")
 
     def _handle_appserver_chat_message(self, chat_id: str, text: str) -> None:
@@ -549,7 +568,7 @@ class CodexFeishuBridgeService:
             f"round={round_number}/{max_rounds}"
         )
         new_thread_id = AppServerTurnRunner(options).submit_new_thread_message(text)
-        self._bind_chat_to_thread(chat_id, new_thread_id)
+        self._bind_chat_to_thread(chat_id, new_thread_id, offset=0)
         self._log(
             "appserver no-rollout recovery submitted in new thread "
             f"chat_id={chat_id} thread_id={new_thread_id} round={round_number}/{max_rounds}"
@@ -594,13 +613,14 @@ class CodexFeishuBridgeService:
             self.feishu.send_text_message(chat_id, UNBOUND_THREAD_HINT)
         return binding
 
-    def _bind_chat_to_thread(self, chat_id: str, thread_id: str) -> None:
-        offset = 0
-        try:
-            rollout_path = self.bridge.resolve_rollout_path(thread_id)
-            offset = rollout_path.stat().st_size
-        except CodexBridgeError:
-            pass
+    def _bind_chat_to_thread(self, chat_id: str, thread_id: str, *, offset: int | None = None) -> None:
+        if offset is None:
+            offset = 0
+            try:
+                rollout_path = self.bridge.resolve_rollout_path(thread_id)
+                offset = rollout_path.stat().st_size
+            except CodexBridgeError:
+                pass
         with self._lock:
             self._bindings[chat_id] = ChatBinding(chat_id=chat_id, thread_id=thread_id, offset=offset)
             self._save_bindings()
