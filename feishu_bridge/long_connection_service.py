@@ -145,10 +145,10 @@ class CodexFeishuLongConnectionBridgeService(CodexFeishuBridgeService):
             return value
         return None
 
-    @staticmethod
-    def _message_text_dedupe_key(chat_id: str, text: str) -> str:
+    def _message_text_dedupe_key(self, chat_id: str, text: str) -> str:
         normalized = " ".join(str(text or "").split())
-        if not normalized or normalized.startswith("/"):
+        command_prefix = str(self.settings.command_prefix or "").strip()
+        if not normalized or (command_prefix and normalized.startswith(command_prefix)):
             return ""
         digest = sha256(normalized.encode("utf-8")).hexdigest()[:24]
         return f"text:{chat_id}:{digest}"

@@ -75,6 +75,23 @@ class BridgeServiceWatcherTests(unittest.TestCase):
         self.assertEqual(new_thread_messages, [])
         self.assertEqual(existing_thread_messages, [("existing-thread", "second message")])
 
+    def test_dollar_prefix_is_recognized_as_command_prefix(self) -> None:
+        service = CodexFeishuBridgeService(BridgeSettings(command_prefix="$"))
+        calls: list[tuple[str, str, str]] = []
+        service._handle_command = lambda chat_id, text: calls.append(("command", chat_id, text))
+        service._handle_chat_message = lambda chat_id, text: calls.append(("chat", chat_id, text))
+
+        service.process_text_message("chat-1", "$status")
+        service.process_text_message("chat-1", "/status")
+
+        self.assertEqual(
+            calls,
+            [
+                ("command", "chat-1", "$status"),
+                ("chat", "chat-1", "/status"),
+            ],
+        )
+
     def test_watcher_reads_rollout_when_session_index_is_missing(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)

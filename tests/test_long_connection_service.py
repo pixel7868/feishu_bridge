@@ -44,18 +44,18 @@ class LongConnectionBridgeServiceTests(unittest.TestCase):
     def test_repeated_attach_commands_with_distinct_message_ids_are_processed(self) -> None:
         service = RecordingLongConnectionBridgeService()
 
-        service._on_message_receive(make_message_event("message-1", "/attach 1"))
-        service._on_message_receive(make_message_event("message-2", "/attach 1"))
+        service._on_message_receive(make_message_event("message-1", "$attach 1"))
+        service._on_message_receive(make_message_event("message-2", "$attach 1"))
 
-        self.assertEqual(service.received, [("chat-1", "/attach 1"), ("chat-1", "/attach 1")])
+        self.assertEqual(service.received, [("chat-1", "$attach 1"), ("chat-1", "$attach 1")])
 
     def test_same_message_id_is_still_deduped(self) -> None:
         service = RecordingLongConnectionBridgeService()
 
-        service._on_message_receive(make_message_event("message-1", "/attach 1"))
-        service._on_message_receive(make_message_event("message-1", "/attach 1"))
+        service._on_message_receive(make_message_event("message-1", "$attach 1"))
+        service._on_message_receive(make_message_event("message-1", "$attach 1"))
 
-        self.assertEqual(service.received, [("chat-1", "/attach 1")])
+        self.assertEqual(service.received, [("chat-1", "$attach 1")])
 
 
 if __name__ == "__main__":

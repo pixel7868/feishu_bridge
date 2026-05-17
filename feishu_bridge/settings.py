@@ -16,7 +16,7 @@ class BridgeSettings:
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
-    command_prefix: str = "/"
+    command_prefix: str = "$"
     receive_mode: str = "long_connection"
     host: str = "127.0.0.1"
     port: int = 9000
